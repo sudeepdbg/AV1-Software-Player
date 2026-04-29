@@ -564,7 +564,7 @@ st.markdown(f"""
       </svg>
     </div>
     <div>
-      <h1>VideoForge <span>AI Pro</span></h1>
+      <h1>AI Encoder</span></h1>
       <p>Professional encoding · AI enhancement · Vnova-style quality upscaling</p>
     </div>
   </div>
