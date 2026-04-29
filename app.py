@@ -14,19 +14,12 @@ import pandas as pd
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="VideoForge · Pro Encoder + AI Enhancement",
-    page_icon="▶",
+    page_icon="▶️",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
 # ── Custom Play Button SVG Icon + CSS ─────────────────────────────────────────
-PLAY_ICON_SVG = """
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="40" height="40">
-  <circle cx="50" cy="50" r="48" fill="white" opacity="0.15"/>
-  <polygon points="38,28 38,72 74,50" fill="white"/>
-</svg>
-"""
-
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
@@ -150,7 +143,7 @@ html, body, [class*="css"] {
     transform: none !important;
 }
 
-/* ── Progress ── */
+/* ── Progress ─ */
 .stProgress > div > div {
     background: linear-gradient(90deg, #1d4ed8, #60a5fa); border-radius: 6px;
 }
@@ -316,40 +309,50 @@ def build_enhance_filters(settings: dict, src_meta: dict) -> list:
     """Build FFmpeg filter chain for AI enhancements."""
     filters = []
 
+    # ── Denoise ─────────────────────────────────────────────────────
     if settings.get("denoise"):
         strength = float(settings.get("denoise_strength", 5))
         s2 = strength / 2
         filters.append(f"hqdn3d={strength}:{strength}:{s2}:{s2}")
 
+    # ── Deblock (FIXED: alpha/beta must be 0.0-1.0) ────────────────
     if settings.get("deblock"):
         strength = int(settings.get("deblock_strength", 5))
-        filters.append(f"deblock=filter=strong:alpha={strength}:beta={max(1, strength//2)}")
+        # Map slider 1-10 → FFmpeg range 0.0-1.0
+        alpha = round(strength / 10.0, 2)   # 1→0.1, 5→0.5, 10→1.0
+        beta = round(alpha * 0.5, 2)         # Beta typically half of alpha
+        filters.append(f"deblock=filter=strong:alpha={alpha}:beta={beta}")
 
+    # ── Sharpening ─────────────────────────────────────────────────
     if settings.get("sharpen"):
         amount = float(settings.get("sharpen_amount", 0.5))
         threshold = int(settings.get("sharpen_threshold", 5))
         filters.append(f"unsharp=5:5:{amount}:{threshold}")
 
+    # ── Color Enhancement ──────────────────────────────────────────
     if settings.get("color_enhance"):
         vibrance = float(settings.get("vibrance", 0.15))
         contrast = float(settings.get("contrast", 1.0))
         sat = round(1.0 + vibrance, 4)
         filters.append(f"eq=contrast={contrast}:saturation={sat}")
 
+    # ── HDR Conversion ─────────────────────────────────────────────
     if settings.get("hdr_convert") and src_meta.get("bit_depth", 8) >= 10:
         filters.append("zscale=transfer=linear,format=gbrpf32le")
         filters.append(f"tonemap={settings.get('tonemap_algo', 'hable')}:desat=0.2")
         filters.append("zscale=transfer=bt709:matrix=bt709:range=tv,format=yuv420p10le")
 
+    # ── Upscaling ──────────────────────────────────────────────────
     if settings.get("upscale"):
         target_w = int(settings.get("upscale_width", src_meta["width"] * 2))
         target_h = int(settings.get("upscale_height", src_meta["height"] * 2))
-        # Ensure divisible by 2 (required by most codecs)
+        # Ensure even dimensions (required by most codecs)
         target_w = target_w if target_w % 2 == 0 else target_w - 1
         target_h = target_h if target_h % 2 == 0 else target_h - 1
         algo = settings.get("upscale_algo", "lanczos")
         filters.append(f"scale={target_w}:{target_h}:flags={algo}+accurate_rnd+full_chroma_int")
 
+    # ── Frame Interpolation ────────────────────────────────────────
     if settings.get("frame_interp"):
         target_fps = int(settings.get("target_fps", 60))
         filters.append(
@@ -434,57 +437,18 @@ def encode(input_path, output_path, codec, crf, enhance_settings: dict, src_meta
         return False, str(e), "\n".join(lines), time.time() - t0
 
 
-def get_resolution(path: str):
-    """Return (width, height) of first video stream, or (0, 0) on failure."""
-    try:
-        out = subprocess.check_output(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_streams", "-select_streams", "v:0", path],
-            text=True, stderr=subprocess.DEVNULL, timeout=15,
-        )
-        d = json.loads(out)
-        s = d.get("streams", [{}])[0]
-        return int(s.get("width", 0)), int(s.get("height", 0))
-    except Exception:
-        return 0, 0
-
-
 def quality_metrics(ref: str, dist: str, do_vmaf: bool) -> dict:
-    """Compute PSNR, SSIM and optionally VMAF via FFmpeg.
-
-    Handles resolution mismatches (e.g. upscaled output) by scaling the
-    reference UP to match the distorted file before comparison, which is the
-    correct approach: we want to measure how well the upscaled output
-    reproduces the *upscaled* reference, not punish for resolution change.
-    """
+    """Compute PSNR, SSIM and optionally VMAF via FFmpeg."""
     res = {"psnr": None, "ssim": None, "vmaf": None}
 
-    # Detect whether ref and dist have matching dimensions
-    ref_w, ref_h = get_resolution(ref)
-    dist_w, dist_h = get_resolution(dist)
-    resolutions_match = (ref_w == dist_w and ref_h == dist_h)
-
-    # Build a filter_complex that scales ref to dist resolution when needed.
-    # [0:v] = dist (encoded output), [1:v] = ref (original source)
-    if resolutions_match:
-        # Simple path — no scaling required
-        psnr_fc = "[0:v][1:v]psnr[po];[0:v][1:v]ssim[so]"
-        vmaf_fc = "[0:v][1:v]libvmaf=log_fmt=json:log_path={path}"
-    else:
-        # Scale ref to match dist so filters can run.
-        # Use the same algorithm as the encode (lanczos) for fairness.
-        scale_filter = f"[1:v]scale={dist_w}:{dist_h}:flags=lanczos[ref_scaled]"
-        psnr_fc = f"{scale_filter};[0:v][ref_scaled]psnr[po];[0:v][ref_scaled]ssim[so]"
-        vmaf_fc = f"{scale_filter};[0:v][ref_scaled]libvmaf=log_fmt=json:log_path={{path}}"
-
-    # ── PSNR + SSIM ────────────────────────────────────────────────────────
+    # PSNR + SSIM
     try:
         cmd = [
             "ffmpeg", "-y", "-i", dist, "-i", ref,
-            "-filter_complex", psnr_fc,
-            "-map", "[po]", "-map", "[so]", "-f", "null", "-",
+            "-filter_complex", "[0:v][1:v]psnr[po];[0:v][1:v]ssim[so]",
+            "-map", "[po]", "-map", "[so]", "-f", "null", "-"
         ]
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=240)
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=180)
         for line in out.splitlines():
             if re.search(r"PSNR", line, re.I):
                 m = re.search(r"average[:\s]+([0-9.]+|inf)", line, re.I)
@@ -498,15 +462,16 @@ def quality_metrics(ref: str, dist: str, do_vmaf: bool) -> dict:
     except Exception:
         pass
 
-    # ── VMAF (optional) ────────────────────────────────────────────────────
+    # VMAF (optional)
     if do_vmaf:
         try:
             vf = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
             vf.close()
             cmd = [
                 "ffmpeg", "-y", "-i", dist, "-i", ref,
-                "-filter_complex", vmaf_fc.format(path=vf.name),
-                "-f", "null", "-",
+                "-filter_complex",
+                f"[0:v][1:v]libvmaf=log_fmt=json:log_path={vf.name}",
+                "-f", "null", "-"
             ]
             subprocess.run(cmd, capture_output=True, timeout=300, check=True)
             with open(vf.name) as f:
@@ -745,42 +710,66 @@ st.divider()
 if enable_encoding:
     st.markdown('<div class="vf-label ai">✨ AI Video Enhancement</div>', unsafe_allow_html=True)
     st.markdown(
-        "Professional-grade enhancements. Toggle features and use presets for quick setup:"
+        "Professional-grade enhancements. Choose a preset or customize individually:"
     )
 
-    # ── Presets ──────────────────────────────────────────────────────────────
+    # ── DISTINCT PRESETS with Clear Use Cases ─────────────────────────────────
+    st.markdown("### 🎯 Quick Presets")
+    st.caption("One-click setups for common scenarios:")
+    
     p1, p2, p3 = st.columns(3)
+    
     with p1:
-        if st.button("🎬 Standard Clean", use_container_width=True):
+        st.markdown("#### 🎬 Standard Clean")
+        st.caption("**Best for:** Noisy, grainy, or compressed footage")
+        st.markdown("• Reduces noise & grain")
+        st.markdown("• Removes blocking artifacts")
+        st.markdown("• Mild sharpening")
+        if st.button("Apply Standard Clean", use_container_width=True, type="secondary"):
             st.session_state.enhance_settings.update({
-                "denoise": True, "denoise_strength": 4,
-                "sharpen": True, "sharpen_amount": 0.3,
-                "deblock": True, "deblock_strength": 4,
+                "denoise": True, "denoise_strength": 5,
+                "deblock": True, "deblock_strength": 5,
+                "sharpen": True, "sharpen_amount": 0.3, "sharpen_threshold": 8,
                 "upscale": False, "hdr_convert": False, "frame_interp": False,
                 "color_enhance": False,
             })
             st.rerun()
+    
     with p2:
-        if st.button("🔍 Detail Boost", use_container_width=True):
+        st.markdown("#### 🎨 Detail & Color Boost")
+        st.caption("**Best for:** Dull, flat, or low-contrast footage")
+        st.markdown("• Enhances sharpness")
+        st.markdown("• Boosts color vibrance")
+        st.markdown("• Increases contrast")
+        if st.button("Apply Detail Boost", use_container_width=True, type="secondary"):
             st.session_state.enhance_settings.update({
-                "sharpen": True, "sharpen_amount": 0.7, "sharpen_threshold": 3,
-                "color_enhance": True, "vibrance": 0.2, "contrast": 1.1,
-                "denoise": False, "upscale": False, "hdr_convert": False,
-                "deblock": False, "frame_interp": False,
+                "sharpen": True, "sharpen_amount": 0.8, "sharpen_threshold": 3,
+                "color_enhance": True, "vibrance": 0.25, "contrast": 1.15,
+                "denoise": False, "deblock": False,
+                "upscale": False, "hdr_convert": False, "frame_interp": False,
             })
             st.rerun()
+    
     with p3:
-        if st.button("🚀 AI Upscale 2×", use_container_width=True):
+        st.markdown("#### 🚀 AI Upscale 2×")
+        st.caption("**Best for:** Low-resolution content (480p→1080p, 1080p→4K)")
+        st.markdown("• 2× resolution upscale")
+        st.markdown("• Pre-denoise for quality")
+        st.markdown("• Post-sharpen details")
+        if st.button("Apply AI Upscale 2×", use_container_width=True, type="secondary"):
             st.session_state.enhance_settings.update({
                 "upscale": True,
                 "upscale_width": meta["width"] * 2,
                 "upscale_height": meta["height"] * 2,
                 "upscale_algo": "lanczos",
-                "denoise": True, "denoise_strength": 5,
-                "sharpen": True, "sharpen_amount": 0.4,
+                "denoise": True, "denoise_strength": 6,
+                "sharpen": True, "sharpen_amount": 0.5, "sharpen_threshold": 5,
                 "hdr_convert": False, "frame_interp": False,
+                "deblock": False, "color_enhance": False,
             })
             st.rerun()
+
+    st.divider()
 
     # Helper: read from session state (widgets write back on change)
     es = st.session_state.enhance_settings
@@ -1076,21 +1065,7 @@ if enable_encoding:
             bar.progress(1.0, text="✅ Encoding complete — computing quality metrics…")
             out_meta = probe(out_path)
             out_sz = os.path.getsize(out_path) / (1024 * 1024)
-
-            # Raw size delta
-            raw_saved = (1 - out_sz / sz_mb) * 100 if sz_mb > 0 else 0.0
-
-            # Detect upscaling and compute pixel-normalised metrics
-            src_w, src_h = meta["width"], meta["height"]
-            out_w = out_meta.get("width") or src_w
-            out_h = out_meta.get("height") or src_h
-            pixel_scale = (out_w * out_h) / (src_w * src_h) if src_w * src_h > 0 else 1.0
-            is_upscaled = pixel_scale > 1.05
-
-            # Pixel-normalised: how big would the output be at source resolution?
-            norm_out_sz = out_sz / pixel_scale if pixel_scale > 0 else out_sz
-            norm_cr = sz_mb / norm_out_sz if norm_out_sz > 0 else 0.0
-            norm_saved = (1 - norm_out_sz / sz_mb) * 100 if sz_mb > 0 else 0.0
+            saved_pct = (1 - out_sz / sz_mb) * 100 if sz_mb > 0 else 0.0
 
             qual = {"psnr": None, "ssim": None, "vmaf": None}
             if do_psnr or (do_vmaf and HAS_VMAF):
@@ -1101,18 +1076,14 @@ if enable_encoding:
             st.session_state.results.append({
                 "codec": codec, "crf": crf,
                 "size_mb": out_sz, "bitrate": out_meta.get("vbitrate_kbps", 0),
-                "enc_time": enc_t,
-                "saved": norm_saved if is_upscaled else raw_saved,
-                "cr": norm_cr if is_upscaled else (sz_mb / out_sz if out_sz > 0 else 0.0),
-                "raw_saved": raw_saved,
-                "is_upscaled": is_upscaled,
-                "pixel_scale": pixel_scale,
+                "enc_time": enc_t, "saved": saved_pct,
+                "cr": sz_mb / out_sz if out_sz > 0 else 0.0,
                 "psnr": qual["psnr"], "ssim": qual["ssim"], "vmaf": qual["vmaf"],
                 "path": out_path,
                 "acodec": meta["acodec"], "abitrate": meta["abitrate_kbps"],
                 "sample_rate": meta["sample_rate"], "channels": meta["channels"],
                 "enhancements": active_enh_dict,
-                "out_res": f"{out_w}×{out_h}",
+                "out_res": f"{out_meta.get('width', meta['width'])}×{out_meta.get('height', meta['height'])}",
                 "out_fps": out_meta.get("fps", meta["fps"]),
             })
             bar.empty()
@@ -1122,21 +1093,18 @@ if enable_encoding:
                 q_parts.append(f"VMAF {qual['vmaf']:.1f}")
             if qual["psnr"] is not None:
                 q_parts.append(f"PSNR {qual['psnr']:.2f} dB")
-            q_str = " · ".join(q_parts) if q_parts else "No quality metrics (check PSNR/SSIM checkbox)"
+            q_str = " · ".join(q_parts) if q_parts else "Analysis complete"
 
-            enh_summary = " + ".join(k.capitalize() for k in _enh_keys if es.get(k))
+            enh_summary = " + ".join(
+                k.capitalize() for k in _enh_keys if es.get(k)
+            )
             enh_str = f" · ✨ {enh_summary}" if enh_summary else ""
 
-            if is_upscaled:
-                size_str = (
-                    f"{out_sz:.2f} MB ({pixel_scale:.1f}× pixels | "
-                    f"norm. {norm_saved:.1f}% {'saved' if norm_saved >= 0 else 'larger vs src'})"
-                )
-            else:
-                dir_word = "saved" if raw_saved >= 0 else "larger by"
-                size_str = f"{out_sz:.2f} MB · {dir_word} {abs(raw_saved):.1f}%"
-
-            st.success(f"✅ {codec} CRF {crf}{enh_str} · {size_str} · {enc_t:.1f}s · {q_str}")
+            st.success(
+                f"✅ {codec} CRF {crf}{enh_str} · "
+                f"{out_sz:.2f} MB · saved {saved_pct:.1f}% · "
+                f"{enc_t:.1f}s · {q_str}"
+            )
 
 else:
     # ── Test Player Mode ──────────────────────────────────────────────────────
@@ -1220,33 +1188,13 @@ with tab_tbl:
         res_info = r.get("out_res", f"{meta['width']}×{meta['height']}")
         fps_info = r.get("out_fps", meta["fps"])
 
-        # Build Saved column — show normalised value with tooltip for upscaled
-        if r.get("is_upscaled"):
-            ps = r.get("pixel_scale", 1.0)
-            saved_cell = (
-                f'<span title="Raw: {r["raw_saved"]:+.1f}% (output is {ps:.1f}× more pixels). '
-                f'Shown value is pixel-normalised." style="color:#7c3aed;font-weight:600">'
-                f'{r["saved"]:.1f}%<sup style="font-size:0.65em"> norm</sup></span>'
-            )
-            cr_cell = (
-                f'<span title="Pixel-normalised compression ratio" style="color:#7c3aed;font-weight:600">'
-                f'{r["cr"]:.2f}×<sup style="font-size:0.65em"> norm</sup></span>'
-            )
-        else:
-            saved_val = r["saved"]
-            if saved_val < 0:
-                saved_cell = f'<span style="color:#b91c1c;font-weight:600">{saved_val:.1f}%</span>'
-            else:
-                saved_cell = f"{saved_val:.1f}%"
-            cr_cell = best_mark(r["cr"], best_cr, "{:.2f}×", True)
-
         rows_html += f"""<tr>
           <td>{tag}</td>
           <td>{r['crf']}</td>
           <td>{best_mark(r['size_mb'], best_sz, '{:.2f} MB')}</td>
           <td>{r['bitrate']} kbps</td>
-          <td>{cr_cell}</td>
-          <td>{saved_cell}</td>
+          <td>{best_mark(r['cr'], best_cr, '{:.2f}×', True)}</td>
+          <td>{r['saved']:.1f}%</td>
           <td>{best_mark(r['enc_time'], best_spd, '{:.1f}s')}</td>
           <td>{vmaf_cell}</td>
           <td>{psnr_display(r['psnr'])}</td>
@@ -1277,7 +1225,7 @@ with tab_tbl:
     )
 
 
-# ── Charts ────────────────────────────────────────────────────────────────────
+# ── Charts ───────────────────────────────────────────────────────────────────
 with tab_chart:
     df = pd.DataFrame([{
         "Codec": r["codec"] + (" ✨" if r.get("enhancements") else ""),
