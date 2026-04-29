@@ -1,0 +1,15 @@
+# ── Desktop (PyQt6) ──────────────────────────────────────────
+PyQt6>=6.6.0
+opencv-python>=4.9.0
+numpy>=1.26.0
+
+# ── Web / Streamlit ──────────────────────────────────────────
+streamlit>=1.35.0
+
+# NOTE: FFmpeg must be installed at the OS level.
+#   Ubuntu/Debian : sudo apt-get install ffmpeg
+#   macOS         : brew install ffmpeg
+#   Windows       : https://ffmpeg.org/download.html  → add to PATH
+#
+# The opencv-python wheel bundles its own FFmpeg build which is sufficient
+# for common codecs (H.264, HEVC, AV1 require the full FFmpeg CLI for encoding).
