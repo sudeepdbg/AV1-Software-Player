@@ -565,7 +565,7 @@ st.markdown(f"""
     </div>
     <div>
       <h1>AI Encoder</span></h1>
-      <p>Professional encoding · AI enhancement · Vnova-style quality upscaling</p>
+      <p>Professional encoding · AI enhancement · quality upscaling</p>
     </div>
   </div>
   <div class="vf-badges">
