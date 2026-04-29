@@ -778,34 +778,39 @@ if enable_encoding:
     if clear:
         st.session_state.results = []
         st.rerun()
-    
-    if go:
+        if go:
         out_path = inp.replace(suf, f"_enh_{codec.split()[0].lower()}_crf{crf}.mp4")
-        bar = st.progress(0.0, text=f"Initializing enhancements + {codec}…", key="prog_encode")
+        
+        # Fixed: Use separate text element instead of text parameter
+        progress_text = st.empty()
+        progress_text.markdown(f"*Initializing enhancements + {codec}…*")
+        bar = st.progress(0.0, key="prog_encode")
 
-        with st.spinner(f"✨ Applying enhancements + encoding {codec} CRF {crf}…"):
+        with st.spinner(f"Applying enhancements + encoding {codec} CRF {crf}…"):
             ok, msg, fflog, enc_t = encode(
                 inp, out_path, codec, crf, 
                 st.session_state.enhance_settings, meta,
-                progress_cb=lambda p: bar.progress(p, text=f"Processing… {p*100:.0f}%"),
+                progress_cb=lambda p: (bar.progress(p), progress_text.markdown(f"*Processing… {p*100:.0f}%")),
                 duration=meta["duration"],
             )
 
         if not ok:
             bar.empty()
+            progress_text.empty()
             st.error(f"❌ {msg}")
             if fflog:
                 with st.expander("📋 FFmpeg Log"):
                     st.code(fflog, language="bash")
         else:
-            bar.progress(1.0, text="✅ Complete — analyzing quality…")
+            bar.progress(1.0)
+            progress_text.markdown("*✅ Complete — analyzing quality…*")
             out_meta = probe(out_path)
             out_sz = os.path.getsize(out_path) / (1024*1024)
             saved_pct = (1 - out_sz/sz_mb)*100 if sz_mb else 0
 
             qual = {"psnr":None,"ssim":None,"vmaf":None}
             if do_psnr or (do_vmaf and HAS_VMAF):
-                with st.spinner("🔍 Computing quality metrics…"):
+                with st.spinner("Computing quality metrics…"):
                     qual = quality_metrics(inp, out_path, do_vmaf and HAS_VMAF)
 
             st.session_state.results.append({
@@ -823,6 +828,7 @@ if enable_encoding:
                 "out_fps": out_meta["fps"]
             })
             bar.empty()
+            progress_text.empty()
             
             q_parts = []
             if qual["vmaf"]: q_parts.append(f"VMAF {qual['vmaf']:.1f}")
@@ -831,9 +837,9 @@ if enable_encoding:
             
             enh_summary = " + ".join([k.capitalize() for k,v in st.session_state.enhance_settings.items() 
                                      if k in ["denoise","sharpen","upscale","hdr_convert","color_enhance","deblock","frame_interp"] and v])
-            enh_str = f" · ✨ {enh_summary}" if enh_summary else ""
+            enh_str = f"· ✨ {enh_summary}" if enh_summary else ""
             
-            st.success(f"✅ {codec} CRF {crf}{enh_str} · {out_sz:.2f} MB · saved {saved_pct:.1f}% · {enc_t:.1f}s · {q_str}")
+            st.success(f"✅ {codec} CRF {crf} {enh_str} · {out_sz:.2f} MB · saved {saved_pct:.1f}% · {enc_t:.1f}s · {q_str}")
 
 else:
     # Test Player Mode
